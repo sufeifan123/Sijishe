@@ -1,596 +1,647 @@
-# -*- coding: utf8 -*-
+#!/usr/bin/env python3
+"""司机社自动签到。
 
-"""
-cron: 0 8 * * *
-new Env('司机社签到');
-环境变量名称：XSIJISHE
-直接使用账号密码登录,格式: 账号&密码
-多个账号使用@或换行间隔
-青龙Python依赖, requests, lxml, selenium, ddddocr
-[task_local]
-#司机社签到
-0 8 * * * https://raw.githubusercontent.com/jzjbyq/AutoCheckIn/main/sijishe.py, tag=司机社签到, enabled=true
-[rewrite_local]
-https://sijishea.com url script-request-header https://raw.githubusercontent.com/jzjbyq/AutoCheckIn/main/sijishe.py
+设计目标：
+- 从受信任的官方发布源自动发现 HTTPS 论坛地址；
+- 在提交账号密码前验证目标确实具有司机社/Discuz 论坛特征；
+- 使用适合 GitHub Actions Ubuntu Runner 的无头 Chrome；
+- 任何关键步骤失败时返回非零退出码。
 """
 
+from __future__ import annotations
+
+import html as html_lib
+import ipaddress
 import os
-from lxml import etree
-import time
-from notify import send
-import urllib3
 import re
-import hashlib
+import shutil
+import socket
+import sys
+import time
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
+from urllib.parse import urljoin, urlparse
+
 import requests
-import random
-import ddddocr
-import json
+from lxml import html
+from requests.adapters import HTTPAdapter
 from selenium import webdriver
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from selenium.webdriver.support.ui import WebDriverWait
+from urllib3.util.retry import Retry
 
-# 禁用不安全请求警告
-urllib3.disable_warnings()
+DEFAULT_RELEASE_SOURCES = (
+    "https://47447.net/",
+    "https://t.me/s/xsijishe",
+)
+SIGN_PATH = "/k_misign-sign.html"
+LOGIN_PATH = "/member.php?mod=logging&action=login"
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/136.0.0.0 Safari/537.36"
+)
+HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "15"))
+PAGE_TIMEOUT = int(os.getenv("PAGE_TIMEOUT", "30"))
 
-# 初始化签到状态值
-checkIn_content = '今日已签到', '签到成功', 'Cookie失效'
-checkIn_status = 2
-send_content = ''
-cookies = {}
+BRAND_MARKERS = ("司机社", "sijishe")
+FORUM_MARKERS = (
+    "discuz",
+    "member.php?mod=logging",
+    "home.php?mod=space",
+    "k_misign",
+    "formhash",
+    "seccode",
+)
+SIGNED_MARKERS = ("今日已签", "您今天已经签到过了")
+SUCCESS_MARKERS = ("签到成功", "恭喜您签到成功")
+LOGIN_SUCCESS_MARKERS = ("退出", "欢迎您回来", "spacecp.php", "action=logout")
+LOGIN_FAILURE_MARKERS = (
+    "密码错误",
+    "登录失败",
+    "验证码填写错误",
+    "抱歉，密码错误",
+)
 
-# 签到积分信息页面
-sign_url = '/k_misign-sign.html'
-formhash = ''
-main_url = ''
-seccodehash = ''
-referer = ''
 
-# 初始化OCR对象
-ocr = None
+class CheckinError(RuntimeError):
+    """可安全展示给 Actions 日志的签到错误。"""
 
-def initialize_webdriver():
-    """初始化WebDriver并设置选项"""
+
+@dataclass(frozen=True)
+class Account:
+    username: str
+    password: str
+
+
+def mask_username(username: str) -> str:
+    """在日志中隐藏大部分账号信息。"""
+    if len(username) <= 2:
+        return "**"
+    return f"{username[0]}***{username[-1]}"
+
+
+def parse_accounts(raw_value: str) -> list[Account]:
+    """解析 XSIJISHE；多账号使用换行分隔，避免误拆邮箱账号。"""
+    if not raw_value or not raw_value.strip():
+        raise CheckinError("未配置 GitHub Secret：XSIJISHE")
+
+    accounts: list[Account] = []
+    for index, entry in enumerate(raw_value.splitlines(), start=1):
+        entry = entry.strip()
+        if not entry:
+            continue
+        username, separator, password = entry.partition("&")
+        if not separator or not username.strip() or not password:
+            raise CheckinError(f"XSIJISHE 中第 {index} 个账号格式错误，应为：账号&密码")
+        accounts.append(Account(username=username.strip(), password=password))
+
+    if not accounts:
+        raise CheckinError("XSIJISHE 中没有可用账号")
+    return accounts
+
+
+def normalize_base_url(raw_url: str) -> str | None:
+    """把候选链接规范为 HTTPS 站点根地址。"""
+    value = html_lib.unescape(raw_url).replace("\\/", "/").strip()
+    value = value.rstrip(".,;:!?)）】]}\"'")
+    if value.startswith("//"):
+        value = "https:" + value
+
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return None
+
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        return None
+    if parsed.username or parsed.password:
+        return None
+
+    host = parsed.hostname.lower().rstrip(".")
+    if host == "localhost" or host.endswith(".local"):
+        return None
+    try:
+        literal_ip = ipaddress.ip_address(host)
+    except ValueError:
+        if "." not in host:
+            return None
+    else:
+        if not literal_ip.is_global:
+            return None
+
+    port = f":{parsed.port}" if parsed.port and parsed.port != 443 else ""
+    return f"https://{host}{port}"
+
+
+def host_resolves_publicly(base_url: str) -> bool:
+    """拒绝解析到私有、回环或保留网络的候选域名。"""
+    parsed = urlparse(base_url)
+    host = parsed.hostname
+    if not host:
+        return False
+    try:
+        addresses = socket.getaddrinfo(
+            host,
+            parsed.port or 443,
+            type=socket.SOCK_STREAM,
+        )
+    except socket.gaierror:
+        return False
+
+    resolved = {item[4][0] for item in addresses}
+    if not resolved:
+        return False
+    try:
+        return all(ipaddress.ip_address(address).is_global for address in resolved)
+    except ValueError:
+        return False
+
+
+def extract_https_candidates(page_text: str, source_url: str) -> list[str]:
+    """从发布页 HTML、正文和脚本中提取 HTTPS 候选站点。"""
+    if not page_text:
+        return []
+
+    source_host = (urlparse(source_url).hostname or "").lower()
+    excluded_hosts = {
+        source_host,
+        "t.me",
+        "telegram.me",
+        "telegram.org",
+        "www.telegram.org",
+        "twitter.com",
+        "x.com",
+        "discord.com",
+        "github.com",
+        "cloudflare.com",
+        "www.cloudflare.com",
+    }
+
+    raw_urls: list[str] = []
+    normalized_text = html_lib.unescape(page_text).replace("\\/", "/")
+
+    try:
+        document = html.fromstring(normalized_text)
+        for href in document.xpath("//a[@href]/@href"):
+            absolute = urljoin(source_url, href)
+            if absolute.lower().startswith("https://"):
+                raw_urls.append(absolute)
+    except (ValueError, TypeError):
+        pass
+
+    raw_urls.extend(
+        re.findall(r"https://[^\s<>\"']+", normalized_text, flags=re.IGNORECASE)
+    )
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for raw_url in raw_urls:
+        candidate = normalize_base_url(raw_url)
+        if not candidate:
+            continue
+        host = (urlparse(candidate).hostname or "").lower()
+        if host in excluded_hosts or host.endswith(".telegram.org"):
+            continue
+        if candidate not in seen:
+            seen.add(candidate)
+            candidates.append(candidate)
+    return candidates
+
+
+def has_forum_fingerprint(page_text: str, final_url: str = "") -> bool:
+    """确认页面同时具有司机社品牌和 Discuz/签到技术特征。"""
+    haystack = f"{page_text}\n{final_url}".lower()
+    has_brand = any(marker.lower() in haystack for marker in BRAND_MARKERS)
+    has_forum = any(marker.lower() in haystack for marker in FORUM_MARKERS)
+    return has_brand and has_forum
+
+
+def build_http_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.update(
+        {"User-Agent": USER_AGENT, "Accept-Language": "zh-CN,zh;q=0.9"}
+    )
+    retry = Retry(
+        total=2,
+        connect=2,
+        read=2,
+        backoff_factor=0.6,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET", "HEAD"}),
+    )
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    return session
+
+
+def locate_chrome_binary() -> str | None:
+    configured = os.getenv("CHROME_BIN", "").strip()
+    if configured:
+        return configured
+    for name in (
+        "google-chrome",
+        "google-chrome-stable",
+        "chromium",
+        "chromium-browser",
+    ):
+        path = shutil.which(name)
+        if path:
+            return path
+    return None
+
+
+def create_webdriver() -> webdriver.Chrome:
     options = webdriver.ChromeOptions()
-    options.binary_location = "chrome-win64/chrome.exe"
-    options.add_argument('--disable-gpu')
-    options.add_argument('--no-sandbox')
-    options.add_argument('--disable-dev-shm-usage')
-    options.add_argument('--disable-extensions')
-    # 用户代理设置
-    options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36')
-    
-    # 如果需要无头模式，取消下行注释
-    # options.add_argument('--headless')
-    
-    driver = webdriver.Chrome(options=options, executable_path='webdriver/chromedriver.exe')
-    # 设置隐式等待
-    driver.implicitly_wait(10)
+    chrome_binary = locate_chrome_binary()
+    if chrome_binary:
+        options.binary_location = chrome_binary
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument(f"--user-agent={USER_AGENT}")
+    options.page_load_strategy = "eager"
+
+    driver = webdriver.Chrome(options=options)
+    driver.set_page_load_timeout(PAGE_TIMEOUT)
     return driver
 
-def string_to_md5(key):
-    """将字符串转换为MD5哈希值"""
-    md5 = hashlib.md5()
-    md5.update(key.encode("utf-8"))
-    return md5.hexdigest()
 
-def getrandom(code_len):
-    """生成随机字符串"""
-    all_char = 'qazwsxedcrfvtgbyhnujmikolpQAZWSXEDCRFVTGBYHNUJIKOLP'
-    index = len(all_char) - 1
-    code = ''
-    for _ in range(code_len):
-        num = random.randint(0, index)
-        code += all_char[num]
-    return code
-
-def get_new_url():
-    """从发布页获取网站地址"""
-    global main_url
-    url = 'https://47447.net/'
-    ot_num = 1
-    ot_max_num = 10
-    
-    while ot_num < ot_max_num:
-        try:
-            print(f'尝试获取最新网址: 第{ot_num}/{ot_max_num}次')
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
-            }
-            res = requests.get(url, headers=headers, timeout=15)
-            rhtml = etree.HTML(res.content.decode('utf-8'))
-
-            urls = checkstatus(rhtml)
-            if urls == '0':
-                print('所有站点都访问失败, 请检查自身网络')
-                exit(0)
-            main_url = urls
-            # 如果要直接指定网址，可以取消下面这行的注释
-            main_url = "https://sijishe.ink"
-            print(f'成功获取有效网址: {main_url}')
-            return 1
-        except Exception as e:
-            print('错误内容', e)
-            print(f'发布页地址获取失败，正在进行第{ot_num}/{ot_max_num}次重试')
-        time.sleep(10)
-        ot_num += 1
-    exit(0)
-
-def checkstatus(r_xpath):
-    """检查发布页中的最新站点并按顺序自动切换"""
-    r_xpath_num = r_xpath.xpath('//ul[@class="speedlist"]/li')
-    for i in range(1, len(r_xpath_num)+1):
-        # 获取地址名称和URL
-        url_name = r_xpath.xpath(f'//ul[@class="speedlist"]/li[{i}]/p/span[@class="url"]/text()')
-        if not url_name:
-            continue
-        
-        url_name = url_name[0]
-        if '地址' in url_name:
-            cs_url = r_xpath.xpath(f'//ul[@class="speedlist"]/li[{i}]/span[@class="btn-open"]/a/@href')
-            if not cs_url:
-                continue
-                
-            cs_url = cs_url[0]
-            try:
-                print('检测网址:', cs_url, '(', url_name.strip(), ')')
-                headers = {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
-                }
-                cs_res = requests.get(cs_url, headers=headers, timeout=10)
-                if cs_res.status_code == 200:
-                    print('网址', cs_url, '有效')
-                    return cs_url
-            except Exception as e:
-                print('网址', cs_url, '失败:', str(e))
-    
-    print('所有地址检测完毕，没有可用的地址')
-    return '0'
-
-def get_cookie_formhash(driver):
-    """初始化cookie和页面formhash信息"""
-    global formhash, seccodehash, referer, cookies
-    formhash = ''
-    
+@contextmanager
+def managed_webdriver() -> Iterator[webdriver.Chrome]:
+    driver = create_webdriver()
     try:
-        print("正在获取必要的页面信息...")
-        driver.get(main_url + '/home.php?mod=space')
-        
-        # 等待页面加载完成，等待referer元素出现
-        wait = WebDriverWait(driver, 15)
-        input_element = wait.until(
-            EC.presence_of_element_located((By.XPATH, '//input[@type="hidden" and @name="referer"]'))
-        )
-        
-        referer = input_element.get_attribute('value')
-        print('Referer: ' + referer)
-        
-        # 访问登录页获取formhash和seccodehash
-        driver.get(referer)
-        cookies = {cookie['name']: cookie['value'] for cookie in driver.get_cookies()}
-        
-        # 获取formhash
-        wait.until(EC.presence_of_element_located((By.NAME, 'formhash')))
-        formhash_element = driver.find_element(By.NAME, 'formhash')
-        formhash = formhash_element.get_attribute('value')
-        print('Formhash: ' + formhash)
-        
-        # 获取seccodehash
-        seccode_element = driver.find_element(By.XPATH, '//span[starts-with(@id, "seccode_")]')
-        seccodehash = seccode_element.get_attribute('id').replace('seccode_', '')
-        print('Seccodehash: ' + seccodehash)
-        
-        return True
-    except Exception as e:
-        print(f"获取页面信息失败: {e}")
-        return False
-
-def cookiedict_to_json(Rcookie):
-    """将cookie字典转换为json格式"""
-    global cookies
-    cookies = {cookie['name']: cookie['value'] for cookie in Rcookie}
-    
-def cookiejar_to_json(Rcookie):
-    """将cookiejar转换为json"""
-    global cookies
-    for item in Rcookie:
-        cookies[item.name] = item.value
-
-def crack_captcha():
-    """识别验证码"""
-    global captcha, cookies
-    
-    url = main_url + '/misc.php?mod=seccode&update=' + str(random.randint(10000, 99999)) + '&idhash=' + seccodehash
-    print('获取验证码的cookie:', cookies)
-    
-    response = requests.get(url, cookies=cookies, headers={
-            'referer': referer,
-            'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.54 Safari/537.36 Edg/101.0.1210.39'
-        })
-        
-    cookiejar_to_json(response.cookies)
-
-    # 将返回的二进制内容写入文件
-    with open("captcha.png", 'wb') as f:
-        f.write(response.content)
-	
-    # 重新以二进制读取方式打开刚刚保存的文件
-    with open('captcha.png', 'rb') as fr:
-        captcha_data = fr.read()
-	
-    captcha = ocr.classification(captcha_data)
-    print(f'识别的验证码: {captcha}')
-    
-    # 校验验证码
-    check_url = main_url + '/misc.php?mod=seccode&action=check&inajax=1&modid=member::logging&idhash=' + seccodehash + '&secverify=' + captcha
-    
-    response = requests.get(check_url, cookies=cookies, headers={
-            'referer': referer,
-            'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.54 Safari/537.36 Edg/101.0.1210.39'
-        })
-    print('验证码校验结果：', response.text)
-
-def login(username, password):
-    """登录函数"""
-    global cookies
-    max_retry = 10  # 最大重试次数
-    retry_count = 0
-    
-    while retry_count < max_retry:
-        data = {
-            'formhash': formhash,
-            'referer': referer,
-            'username': username,
-            'password': password,
-            'questionid': '0',
-            'answer': '',
-            'seccodehash': seccodehash,
-            'seccodemodid': 'member::logging',
-            'seccodeverify': captcha,
-            'cookietime': '2592000'
-        }
-        
-        headers = {
-            'content-type': 'application/x-www-form-urlencoded',
-            'referer': referer,
-            'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.54 Safari/537.36 Edg/101.0.1210.39'
-        }
-
-        login_url = main_url + '/member.php?mod=logging&action=login&loginsubmit=yes&frommessage&loginhash=L' + getrandom(4) + '&inajax=1'
-        
-        try:
-            print(f'尝试登录: {username}')
-            print(f'登录URL: {login_url}')
-            
-            response = requests.post(login_url, cookies=cookies, headers=headers, data=data)
-            
-            if '欢迎您回来' in response.text:
-                cookiejar_to_json(response.cookies)
-                print(f'账号 {username} 登录成功!')
-                return 1
-            else:
-                print(f'账号 {username} 登录失败，可能是验证码问题，回应内容: {response.text}')
-        except Exception as e:
-            print(f'登录过程中出现异常: {str(e)}')
-        
-        retry_count += 1
-        print(f'登录失败，正在进行第 {retry_count}/{max_retry} 次重试...')
-        
-        # 如果验证码错误，重新执行识别验证码的方法
-        crack_captcha()
-        
-    print(f'账号 {username} 登录失败，已达到最大尝试次数。')
-    return 0
-    
-def do_sign_in(driver):
-    """使用Selenium执行签到操作"""
-    global checkIn_status
-    
-    try:
-        print("正在执行签到操作...")
-        
-        # 访问签到页面
-        sign_page_url = f"{main_url}{sign_url}"
-        print(f"访问签到页面: {sign_page_url}")
-        # 设置cookie
-        for cookie_name, cookie_value in cookies.items():
-            driver.add_cookie({'name': cookie_name, 'value': cookie_value})
-        
-        # 访问签到页面
-        driver.get(sign_page_url)
-        
-        # 等待页面加载完成
-        wait = WebDriverWait(driver, 15)
-        wait.until(EC.presence_of_element_located((By.ID, 'JD_sign')))
-        
-        # 检查是否已经签到
-        page_source = driver.page_source
-        if "今日已签" in page_source or "您今天已经签到过了" in page_source:
-            print("今日已签到")
-            checkIn_status = 0
-            return True
-        
-        # 点击签到按钮
-        sign_button = driver.find_element(By.ID, 'JD_sign')
-        print("找到签到按钮，准备点击")
-        
-        # 在点击前截图
-        driver.save_screenshot("before_sign.png")
-        
-        # 执行点击
-        sign_button.click()
-        print("已点击签到按钮")
-        
-        # 等待签到结果
-        time.sleep(2)
-        
-        # 在点击后截图
-        driver.save_screenshot("after_sign.png")
-        
-        # 检查签到结果
-        new_page_source = driver.page_source
-        if "今日已签" in new_page_source or "您今天已经签到过了" in new_page_source:
-            print("签到成功，页面显示今日已签到")
-            checkIn_status = 0
-            return True
-        elif "签到成功" in new_page_source:
-            print("签到成功")
-            checkIn_status = 1
-            return True
-        else:
-            print("签到后页面未显示成功信息，可能签到失败")
-            
-            # 尝试刷新页面再次检查
-            driver.refresh()
-            time.sleep(2)
-            
-            # 检查刷新后的页面
-            refresh_page_source = driver.page_source
-            if "今日已签" in refresh_page_source or "您今天已经签到过了" in refresh_page_source:
-                print("刷新后确认签到成功")
-                checkIn_status = 0
-                return True
-            
-            checkIn_status = 2
-            return False
-            
-    except Exception as e:
-        print(f"签到过程中出现异常: {str(e)}")
-        checkIn_status = 2
-        return False
-
-def printUserInfo(driver):
-    """获取用户信息"""
-    global send_content, checkIn_status
-    
-    try:
-        print("准备获取用户信息...")
-        
-        # 打开签到页面获取签到信息
-        print(f"访问签到页面: {main_url}{sign_url}")
-        driver.get(f'{main_url}{sign_url}')
-        
-        # 使用显式等待确保页面加载完成
-        wait = WebDriverWait(driver, 20)
-        
-        # 等待并获取签到相关信息
-        wait.until(EC.presence_of_element_located((By.ID, 'qiandaobtnnum')))
-        
-        # 获取签到信息
-        qiandao_num = driver.find_element(By.ID, 'qiandaobtnnum').get_attribute('value')
-        lxdays = driver.find_element(By.ID, 'lxdays').get_attribute('value')
-        lxtdays = driver.find_element(By.ID, 'lxtdays').get_attribute('value')
-        lxlevel = driver.find_element(By.ID, 'lxlevel').get_attribute('value')
-        lxreward = driver.find_element(By.ID, 'lxreward').get_attribute('value')
-        
-        # 修改：检查签到状态
-        try:
-            # 检查页面上是否有签到成功的信息
-            page_content = driver.page_source
-            if "今日已签" in page_content or "您今天已经签到过了" in page_content:
-                print("页面显示今日已签到")
-                checkIn_status = 0
-            elif "签到成功" in page_content:
-                print("页面显示签到成功")
-                checkIn_status = 1
-        except:
-            # 如果无法检查，保持当前状态
-            pass
-        
-        # 格式化签到信息内容
-        lxqiandao_content = f'签到排名：{qiandao_num}\n签到等级：Lv.{lxlevel}\n连续签到：{lxdays} 天\n签到总数：{lxtdays} 天\n签到奖励：{lxreward}\n'
-        
-        # 打开个人主页获取用户信息
-        print(f"访问个人主页: {main_url}/home.php?mod=space")
-        driver.get(f'{main_url}/home.php?mod=space')
-        
-        try:
-            # 等待页面加载完成，确保用户名元素存在
-            wait.until(EC.presence_of_element_located((By.XPATH, '//*[@id="ct"]')))
-            
-            # 截图保存当前页面（调试用）
-            driver.save_screenshot("profile_page.png")
-            
-            # 尝试获取用户名，使用多种可能的XPath
-            xm = None
-            xpaths = [
-                '//*[@id="ct"]/div/div[2]/div/div[1]/div[1]/h2',
-                '//div[contains(@class, "h")]/h2',
-                '//h2[contains(@class, "mt")]',
-                '//div[contains(@id, "profile")]//h2'
-            ]
-            
-            for xpath in xpaths:
-                try:
-                    elements = driver.find_elements(By.XPATH, xpath)
-                    if elements:
-                        xm = elements[0].text.strip()
-                        print(f"找到用户名: {xm}")
-                        break
-                except:
-                    continue
-            
-            if not xm:
-                # 如果无法获取用户名，可能是页面结构变化
-                print("警告: 无法获取用户名，将使用默认值")
-                xm = "未知用户"
-            
-            # 获取各项数据，使用更灵活的方法
-            jf = ww = cp = gx = "未知"
-            
-            try:
-                # 尝试按照常规布局查找统计信息
-                stats_container = driver.find_element(By.ID, "psts")
-                stats = stats_container.find_elements(By.TAG_NAME, "li")
-                
-                # 遍历所有li元素查找统计信息
-                for stat in stats:
-                    stat_text = stat.text.lower()
-                    if "积分" in stat_text:
-                        jf = stat_text
-                    elif "威望" in stat_text:
-                        ww = stat_text
-                    elif "车票" in stat_text:
-                        cp = stat_text
-                    elif "贡献" in stat_text:
-                        gx = stat_text
-            except:
-                # 备用方法：尝试通过其他方式获取
-                try:
-                    all_elements = driver.find_elements(By.XPATH, "//*[contains(text(), '积分') or contains(text(), '威望') or contains(text(), '车票') or contains(text(), '贡献')]")
-                    
-                    for element in all_elements:
-                        text = element.text.lower()
-                        if "积分" in text:
-                            jf = text
-                        elif "威望" in text:
-                            ww = text
-                        elif "车票" in text:
-                            cp = text
-                        elif "贡献" in text:
-                            gx = text
-                except Exception as e:
-                    print(f"无法获取详细统计信息: {str(e)}")
-            
-            # 格式化输出内容并居中
-            xm = "账户【" + xm + "】"
-            xm = xm.center(24, '=')
-            
-            info_text = (
-                f'{xm}\n'
-                f'签到状态: {checkIn_content[checkIn_status]} \n'
-                f'{lxqiandao_content} \n'
-                f'当前积分: {jf}\n'
-                f'当前威望: {ww}\n'
-                f'当前车票: {cp}\n'
-                f'当前贡献: {gx}\n\n'
-            )
-            
-            print(info_text)
-            send_content += info_text
-            return True
-            
-        except TimeoutException:
-            print("获取用户信息超时")
-            # 截图当前页面以便调试
-            driver.save_screenshot("timeout_error.png")
-            print("页面源码:", driver.page_source)
-            send_content += f'获取用户信息超时，请检查网络或站点状态\n\n'
-            return False
-            
-    except Exception as e:
-        print(f'获取用户信息失败: {str(e)}')
-        # 保存屏幕截图以便调试
-        try:
-            driver.save_screenshot("error_screenshot.png")
-            print("保存错误截图到 error_screenshot.png")
-        except:
-            pass
-        send_content += f'获取用户信息失败: {str(e)}\n\n'
-        return False
-
-def start(postdata):
-    """主函数，处理账号信息并执行签到"""
-    global send_content, ocr, cookies
-    
-    try:
-        # 初始化OCR
-        ocr = ddddocr.DdddOcr()
-        
-        # 初始化WebDriver
-        driver = initialize_webdriver()
-        
-        try:
-            # 账号数据按格式分割
-            payload = re.split('@|\n', postdata)
-            print('发现', len(payload), '个账号信息\n')
-            send_content += f'发现 {len(payload)} 个账号信息\n'
-        except Exception as e:
-            print(f'环境变量格式错误: {str(e)}, 程序退出')
-            exit(0)
-        
-        for i in payload:
-            try:
-                u = i.split('&')
-                # 读取账号到变量，密码直接使用原始密码
-                name = u[0]
-                pwd = u[1]  # 不再使用MD5加密，因为Selenium需要使用原始密码
-                print(f'处理账号: {name}')
-            except:
-                print('账号参数格式错误')
-                send_content += "账号参数格式错误\n\n"
-                continue
-
-            # 刷新cookie和formhash值，用作登录
-            if not get_cookie_formhash(driver):
-                send_content += f'账号{name}获取登录页面失败\n\n'
-                continue
-                
-            # 识别验证码
-            crack_captcha()
-            
-            # 使用Selenium登录
-            if not login(name, pwd):
-                send_content += f'账号{name}登录失败,请检查账号密码\n\n'
-                continue
-                
-            # 使用Selenium执行签到
-            do_sign_in(driver)
-            
-            # 获取用户信息
-            printUserInfo(driver)
-            
-            # 每个账号处理完毕后等待一段时间
-            time.sleep(3)
-        
-        # 关闭WebDriver
+        yield driver
+    finally:
         driver.quit()
-        
-        # 发送通知
-        send('司机社签到', send_content)
-        
-    except Exception as e:
-        print(f'执行过程中发生错误: {str(e)}')
-        send_content += f'执行过程中发生错误: {str(e)}\n'
-        send('司机社签到', send_content)
 
-# 阿里云函数入口
-def handler(event, context):
+
+def wait_for_document(driver: webdriver.Chrome, timeout: int = 15) -> None:
+    WebDriverWait(driver, timeout).until(
+        lambda current: (
+            current.execute_script("return document.readyState")
+            in {"interactive", "complete"}
+        )
+    )
+
+
+def browser_page(
+    driver: webdriver.Chrome, url: str, pause: float = 1.5
+) -> tuple[str, str]:
+    driver.get(url)
+    wait_for_document(driver)
+    if pause:
+        time.sleep(pause)
+    return driver.page_source, driver.current_url
+
+
+def get_release_sources() -> tuple[str, ...]:
+    configured = os.getenv("FORUM_RELEASE_URLS", "").strip()
+    if not configured:
+        return DEFAULT_RELEASE_SOURCES
+
+    sources: list[str] = []
+    for entry in re.split(r"[,;\r\n]+", configured):
+        normalized = normalize_base_url(entry.strip())
+        if normalized:
+            sources.append(entry.strip())
+    return tuple(sources) or DEFAULT_RELEASE_SOURCES
+
+
+def collect_candidates(
+    driver: webdriver.Chrome, session: requests.Session, sources: Iterable[str]
+) -> list[str]:
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    for source in sources:
+        source_candidates: list[str] = []
+        try:
+            response = session.get(source, timeout=HTTP_TIMEOUT, allow_redirects=True)
+            if response.ok:
+                source_candidates.extend(
+                    extract_https_candidates(response.text, source)
+                )
+            else:
+                print(
+                    f"发布源返回 HTTP {response.status_code}，尝试浏览器模式：{source}"
+                )
+        except requests.RequestException as exc:
+            print(
+                "普通请求无法读取发布源，尝试浏览器模式："
+                f"{source}（{type(exc).__name__}）"
+            )
+
+        if not source_candidates:
+            try:
+                page_text, final_url = browser_page(driver, source, pause=2.5)
+                source_candidates.extend(extract_https_candidates(page_text, source))
+                if normalize_base_url(final_url) != normalize_base_url(source):
+                    source_candidates.insert(0, final_url)
+            except Exception as exc:
+                # 只记录异常类型，不输出可能含页面数据的详情。
+                print(f"浏览器无法读取发布源：{source}（{type(exc).__name__}）")
+
+        for candidate in source_candidates:
+            normalized = normalize_base_url(candidate)
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                candidates.append(normalized)
+
+    return candidates
+
+
+def validate_candidate_with_requests(
+    session: requests.Session, candidate: str
+) -> str | None:
+    """不携带账号信息验证候选站点，成功时返回最终 HTTPS 根地址。"""
+    if not host_resolves_publicly(candidate):
+        return None
+    combined_text = ""
+    final_base = candidate
+    for path in ("/", LOGIN_PATH):
+        try:
+            response = session.get(
+                urljoin(candidate + "/", path.lstrip("/")),
+                timeout=HTTP_TIMEOUT,
+                allow_redirects=True,
+            )
+        except requests.RequestException:
+            return None
+
+        if response.status_code >= 400:
+            return None
+        normalized_final = normalize_base_url(response.url)
+        if not normalized_final:
+            return None
+        final_base = normalized_final
+        combined_text += "\n" + response.text[:1_000_000]
+
+    if has_forum_fingerprint(combined_text, final_base):
+        return final_base
+    return None
+
+
+def validate_candidate_with_browser(
+    driver: webdriver.Chrome, candidate: str
+) -> str | None:
+    if not host_resolves_publicly(candidate):
+        return None
     try:
-        _postdata = "账号&密码"
+        page_text, final_url = browser_page(
+            driver,
+            urljoin(candidate + "/", LOGIN_PATH.lstrip("/")),
+            pause=1.5,
+        )
     except Exception:
-        print('未设置环境变量 XSIJISHE')
-        exit(0)
-        
-    # 添加随机延时
-    delay = random.randint(0, 1)  # 随机延时0-1秒
-    time.sleep(delay)
-    
-    # 获取网站地址并执行签到
-    if get_new_url():
-        start(_postdata)
-    exit(0)
+        return None
 
-if __name__ == '__main__':
-    handler('', '')
+    final_base = normalize_base_url(final_url)
+    if final_base and has_forum_fingerprint(page_text, final_url):
+        return final_base
+    return None
+
+
+def resolve_forum_url(driver: webdriver.Chrome) -> str:
+    session = build_http_session()
+    configured_url = os.getenv("FORUM_URL", "").strip()
+
+    if configured_url:
+        normalized = normalize_base_url(configured_url)
+        if not normalized:
+            raise CheckinError("FORUM_URL 必须是有效的 HTTPS 地址")
+        candidates = [normalized]
+        print("检测手动指定的论坛地址")
+    else:
+        print("正在从官方发布源自动查询 HTTPS 论坛地址")
+        candidates = collect_candidates(driver, session, get_release_sources())
+        if not candidates:
+            raise CheckinError(
+                "官方发布源没有返回候选地址；可在 GitHub Variables 中临时设置 FORUM_URL"
+            )
+
+    print(f"发现 {len(candidates)} 个 HTTPS 候选地址，开始安全验证")
+    for index, candidate in enumerate(candidates, start=1):
+        print(f"验证候选地址 {index}/{len(candidates)}：{candidate}")
+        validated = validate_candidate_with_requests(session, candidate)
+        if not validated:
+            validated = validate_candidate_with_browser(driver, candidate)
+        if validated:
+            print(f"已选择有效论坛地址：{validated}")
+            return validated
+
+    raise CheckinError(
+        "没有找到通过 HTTPS、证书和论坛页面特征验证的地址；不会提交账号密码"
+    )
+
+
+def find_first(driver: webdriver.Chrome, selectors: Iterable[tuple[str, str]]):
+    for by, value in selectors:
+        elements = driver.find_elements(by, value)
+        for element in elements:
+            if element.is_displayed():
+                return element
+    return None
+
+
+def solve_captcha(driver: webdriver.Chrome) -> str | None:
+    input_element = find_first(
+        driver,
+        (
+            (By.NAME, "seccodeverify"),
+            (By.CSS_SELECTOR, "input[name*='seccodeverify']"),
+        ),
+    )
+    if input_element is None:
+        return None
+
+    image_element = find_first(
+        driver,
+        (
+            (By.CSS_SELECTOR, "img[src*='seccode']"),
+            (By.CSS_SELECTOR, "span[id^='seccode_'] img"),
+            (By.CSS_SELECTOR, "img[id^='vseccode_']"),
+        ),
+    )
+    if image_element is None:
+        raise CheckinError("登录页要求验证码，但没有找到验证码图片")
+
+    # 延迟加载可避免在不需要验证码时初始化体积较大的 OCR 模型。
+    import ddddocr
+
+    ocr = ddddocr.DdddOcr(show_ad=False)
+    result = ocr.classification(image_element.screenshot_as_png).strip()
+    result = re.sub(r"\s+", "", result)
+    if not result:
+        raise CheckinError("验证码识别结果为空")
+    input_element.clear()
+    input_element.send_keys(result)
+    return result
+
+
+def page_indicates_logged_in(page_text: str) -> bool:
+    lowered = page_text.lower()
+    return any(marker.lower() in lowered for marker in LOGIN_SUCCESS_MARKERS)
+
+
+def login(driver: webdriver.Chrome, base_url: str, account: Account) -> None:
+    login_url = urljoin(base_url + "/", LOGIN_PATH.lstrip("/"))
+
+    for attempt in range(1, 4):
+        print(f"登录尝试 {attempt}/3")
+        driver.delete_all_cookies()
+        browser_page(driver, login_url, pause=1.0)
+
+        username_input = find_first(
+            driver,
+            (
+                (By.NAME, "username"),
+                (By.CSS_SELECTOR, "input[name='username']"),
+                (By.CSS_SELECTOR, "input[type='text']"),
+            ),
+        )
+        password_input = find_first(
+            driver,
+            ((By.NAME, "password"), (By.CSS_SELECTOR, "input[type='password']")),
+        )
+        if username_input is None or password_input is None:
+            raise CheckinError("登录页结构已变化：没有找到账号或密码输入框")
+
+        username_input.clear()
+        username_input.send_keys(account.username)
+        password_input.clear()
+        password_input.send_keys(account.password)
+
+        try:
+            solve_captcha(driver)
+        except CheckinError as exc:
+            if attempt == 3:
+                raise
+            print(f"{exc}，刷新后重试")
+            continue
+
+        submit = find_first(
+            driver,
+            (
+                (By.CSS_SELECTOR, "button[name='loginsubmit']"),
+                (By.CSS_SELECTOR, "input[name='loginsubmit']"),
+                (By.CSS_SELECTOR, "button[type='submit']"),
+                (By.CSS_SELECTOR, "input[type='submit']"),
+            ),
+        )
+        if submit is None:
+            raise CheckinError("登录页结构已变化：没有找到登录按钮")
+
+        submit.click()
+        time.sleep(3)
+        page_text = driver.page_source
+        if any(marker in page_text for marker in LOGIN_FAILURE_MARKERS):
+            if attempt == 3:
+                raise CheckinError("登录失败，请检查账号、密码或验证码")
+            continue
+
+        # 重新访问个人页，避免 Discuz 弹窗登录完成后页面状态没有及时刷新。
+        browser_page(
+            driver,
+            urljoin(base_url + "/", "home.php?mod=space"),
+            pause=1.5,
+        )
+        if page_indicates_logged_in(driver.page_source):
+            print("账号登录成功")
+            return
+
+        # 一些主题不显示“退出”文字，认证 Cookie 可作为补充判断。
+        cookie_names = {
+            cookie.get("name", "").lower() for cookie in driver.get_cookies()
+        }
+        if any("auth" in name for name in cookie_names):
+            print("账号登录成功")
+            return
+
+    raise CheckinError("登录状态验证失败")
+
+
+def perform_checkin(driver: webdriver.Chrome, base_url: str) -> str:
+    sign_url = urljoin(base_url + "/", SIGN_PATH.lstrip("/"))
+    print("正在打开签到页面")
+    browser_page(driver, sign_url, pause=1.5)
+    page_text = driver.page_source
+
+    if any(marker in page_text for marker in SIGNED_MARKERS):
+        return "今日已签到"
+
+    try:
+        sign_button = WebDriverWait(driver, 15).until(
+            EC.element_to_be_clickable((By.ID, "JD_sign"))
+        )
+    except TimeoutException as exc:
+        raise CheckinError("签到页面结构已变化：没有找到签到按钮") from exc
+
+    sign_button.click()
+    try:
+        WebDriverWait(driver, 12).until(
+            lambda current: any(
+                marker in current.page_source
+                for marker in (*SIGNED_MARKERS, *SUCCESS_MARKERS)
+            )
+        )
+    except TimeoutException:
+        driver.refresh()
+        wait_for_document(driver)
+        time.sleep(1.5)
+
+    result_page = driver.page_source
+    if any(marker in result_page for marker in SIGNED_MARKERS):
+        return "签到成功（页面显示今日已签到）"
+    if any(marker in result_page for marker in SUCCESS_MARKERS):
+        return "签到成功"
+    raise CheckinError("点击签到后未检测到成功状态")
+
+
+def run() -> int:
+    accounts = parse_accounts(os.getenv("XSIJISHE", ""))
+    print(f"已读取 {len(accounts)} 个账号")
+
+    with managed_webdriver() as discovery_driver:
+        base_url = resolve_forum_url(discovery_driver)
+
+    failures: list[str] = []
+    for index, account in enumerate(accounts, start=1):
+        masked = mask_username(account.username)
+        print(f"开始处理账号 {index}/{len(accounts)}：{masked}")
+        try:
+            with managed_webdriver() as driver:
+                login(driver, base_url, account)
+                result = perform_checkin(driver, base_url)
+            print(f"账号 {masked}：{result}")
+        except CheckinError as exc:
+            failures.append(f"账号 {masked}：{exc}")
+            print(f"账号 {masked} 处理失败：{exc}", file=sys.stderr)
+        except Exception as exc:
+            failures.append(f"账号 {masked}：未预期错误 {type(exc).__name__}")
+            print(
+                f"账号 {masked} 发生未预期错误：{type(exc).__name__}",
+                file=sys.stderr,
+            )
+
+    if failures:
+        print("签到任务失败：", file=sys.stderr)
+        for failure in failures:
+            print(f"- {failure}", file=sys.stderr)
+        return 1
+
+    print("所有账号处理完成")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(run())
+    except CheckinError as exc:
+        print(f"任务失败：{exc}", file=sys.stderr)
+        raise SystemExit(1)

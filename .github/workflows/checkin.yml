@@ -1,0 +1,44 @@
+name: 司机社每日签到
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sijishe-checkin
+  cancel-in-progress: false
+
+jobs:
+  checkin:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v6
+
+      - name: 配置 Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: 安装 Python 依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: 运行单元测试
+        run: python -m unittest discover -s tests -v
+
+      - name: 检查 Chrome
+        run: google-chrome --version
+
+      - name: 执行签到
+        env:
+          PYTHONUNBUFFERED: "1"
+          XSIJISHE: ${{ secrets.XSIJISHE }}
+          FORUM_URL: ${{ vars.FORUM_URL }}
+        run: python sijishe.py

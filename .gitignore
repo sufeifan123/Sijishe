@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.env
+captcha.png
+before_sign.png
+after_sign.png
+profile_page.png
+error_screenshot.png
+timeout_error.png
