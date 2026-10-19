@@ -1,12 +1,16 @@
+import os
 import unittest
+from unittest.mock import Mock, patch
 
 from sijishe import (
     CheckinError,
+    driver_indicates_logged_in,
     extract_https_candidates,
     has_forum_fingerprint,
     mask_username,
     normalize_base_url,
     parse_accounts,
+    resolve_forum_urls,
 )
 
 
@@ -60,6 +64,51 @@ class UrlDiscoveryTests(unittest.TestCase):
         )
         self.assertFalse(has_forum_fingerprint("<title>司机社发布页</title>"))
         self.assertFalse(has_forum_fingerprint("Discuz login formhash"))
+
+    @patch("sijishe.validate_candidate_with_browser")
+    @patch("sijishe.validate_candidate_with_requests")
+    @patch("sijishe.collect_candidates")
+    @patch("sijishe.build_http_session")
+    def test_multiple_validated_candidates_are_retained_for_failover(
+        self,
+        build_session,
+        collect_candidates,
+        validate_with_requests,
+        validate_with_browser,
+    ):
+        build_session.return_value = Mock()
+        collect_candidates.return_value = [
+            "https://one.example",
+            "https://two.example",
+            "https://three.example",
+        ]
+        validate_with_requests.side_effect = [
+            "https://one.example",
+            None,
+            "https://three.example",
+        ]
+        validate_with_browser.side_effect = ["https://two.example"]
+
+        with patch.dict(os.environ, {"FORUM_URL": ""}):
+            result = resolve_forum_urls(Mock())
+
+        self.assertEqual(
+            result,
+            [
+                "https://one.example",
+                "https://two.example",
+                "https://three.example",
+            ],
+        )
+
+
+class LoginStateTests(unittest.TestCase):
+    def test_auth_cookie_takes_precedence_over_failure_text(self):
+        driver = Mock()
+        driver.page_source = "登录失败"
+        driver.get_cookies.return_value = [{"name": "abc_auth", "value": "token"}]
+
+        self.assertTrue(driver_indicates_logged_in(driver))
 
 
 if __name__ == "__main__":

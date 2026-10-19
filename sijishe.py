@@ -46,6 +46,8 @@ USER_AGENT = (
 )
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "15"))
 PAGE_TIMEOUT = int(os.getenv("PAGE_TIMEOUT", "30"))
+MAX_FORUM_CANDIDATES = 4
+LOGIN_ATTEMPTS = 5
 
 BRAND_MARKERS = ("司机社", "sijishe")
 FORUM_MARKERS = (
@@ -407,7 +409,8 @@ def validate_candidate_with_browser(
     return None
 
 
-def resolve_forum_url(driver: webdriver.Chrome) -> str:
+def resolve_forum_urls(driver: webdriver.Chrome) -> list[str]:
+    """返回通过安全验证的论坛地址，供登录失败时依次切换。"""
     session = build_http_session()
     configured_url = os.getenv("FORUM_URL", "").strip()
 
@@ -426,18 +429,30 @@ def resolve_forum_url(driver: webdriver.Chrome) -> str:
             )
 
     print(f"发现 {len(candidates)} 个 HTTPS 候选地址，开始安全验证")
+    validated_candidates: list[str] = []
     for index, candidate in enumerate(candidates, start=1):
         print(f"验证候选地址 {index}/{len(candidates)}：{candidate}")
         validated = validate_candidate_with_requests(session, candidate)
         if not validated:
             validated = validate_candidate_with_browser(driver, candidate)
-        if validated:
-            print(f"已选择有效论坛地址：{validated}")
-            return validated
+        if validated and validated not in validated_candidates:
+            validated_candidates.append(validated)
+            print(f"有效论坛地址 {len(validated_candidates)}：{validated}")
+            if configured_url or len(validated_candidates) >= MAX_FORUM_CANDIDATES:
+                break
+
+    if validated_candidates:
+        print(f"共保留 {len(validated_candidates)} 个有效论坛地址")
+        return validated_candidates
 
     raise CheckinError(
         "没有找到通过 HTTPS、证书和论坛页面特征验证的地址；不会提交账号密码"
     )
+
+
+def resolve_forum_url(driver: webdriver.Chrome) -> str:
+    """兼容只需要一个论坛地址的调用方。"""
+    return resolve_forum_urls(driver)[0]
 
 
 def find_first(driver: webdriver.Chrome, selectors: Iterable[tuple[str, str]]):
@@ -471,6 +486,16 @@ def solve_captcha(driver: webdriver.Chrome) -> str | None:
     if image_element is None:
         raise CheckinError("登录页要求验证码，但没有找到验证码图片")
 
+    try:
+        WebDriverWait(driver, 10).until(
+            lambda current: current.execute_script(
+                "return arguments[0].complete && arguments[0].naturalWidth > 0",
+                image_element,
+            )
+        )
+    except TimeoutException as exc:
+        raise CheckinError("验证码图片加载超时") from exc
+
     # 延迟加载可避免在不需要验证码时初始化体积较大的 OCR 模型。
     import ddddocr
 
@@ -489,12 +514,20 @@ def page_indicates_logged_in(page_text: str) -> bool:
     return any(marker.lower() in lowered for marker in LOGIN_SUCCESS_MARKERS)
 
 
+def driver_indicates_logged_in(driver: webdriver.Chrome) -> bool:
+    """结合页面和认证 Cookie 判断登录状态，避免被页面内的失败文案误判。"""
+    if page_indicates_logged_in(driver.page_source):
+        return True
+    cookie_names = {cookie.get("name", "").lower() for cookie in driver.get_cookies()}
+    return any("auth" in name for name in cookie_names)
+
+
 def login(driver: webdriver.Chrome, base_url: str, account: Account) -> None:
     login_url = urljoin(base_url + "/", LOGIN_PATH.lstrip("/"))
+    driver.delete_all_cookies()
 
-    for attempt in range(1, 4):
-        print(f"登录尝试 {attempt}/3")
-        driver.delete_all_cookies()
+    for attempt in range(1, LOGIN_ATTEMPTS + 1):
+        print(f"登录尝试 {attempt}/{LOGIN_ATTEMPTS}")
         browser_page(driver, login_url, pause=1.0)
 
         username_input = find_first(
@@ -510,7 +543,14 @@ def login(driver: webdriver.Chrome, base_url: str, account: Account) -> None:
             ((By.NAME, "password"), (By.CSS_SELECTOR, "input[type='password']")),
         )
         if username_input is None or password_input is None:
-            raise CheckinError("登录页结构已变化：没有找到账号或密码输入框")
+            if driver_indicates_logged_in(driver):
+                print("账号登录成功")
+                return
+            if attempt == LOGIN_ATTEMPTS:
+                raise CheckinError("登录页结构已变化：没有找到账号或密码输入框")
+            print("登录表单暂时不可用，保留当前会话后重试")
+            time.sleep(2)
+            continue
 
         username_input.clear()
         username_input.send_keys(account.username)
@@ -520,7 +560,7 @@ def login(driver: webdriver.Chrome, base_url: str, account: Account) -> None:
         try:
             solve_captcha(driver)
         except CheckinError as exc:
-            if attempt == 3:
+            if attempt == LOGIN_ATTEMPTS:
                 raise
             print(f"{exc}，刷新后重试")
             continue
@@ -540,9 +580,13 @@ def login(driver: webdriver.Chrome, base_url: str, account: Account) -> None:
         submit.click()
         time.sleep(3)
         page_text = driver.page_source
+        if driver_indicates_logged_in(driver):
+            print("账号登录成功")
+            return
         if any(marker in page_text for marker in LOGIN_FAILURE_MARKERS):
-            if attempt == 3:
+            if attempt == LOGIN_ATTEMPTS:
                 raise CheckinError("登录失败，请检查账号、密码或验证码")
+            print("登录未成功，保留当前会话并刷新验证码后重试")
             continue
 
         # 重新访问个人页，避免 Discuz 弹窗登录完成后页面状态没有及时刷新。
@@ -551,15 +595,7 @@ def login(driver: webdriver.Chrome, base_url: str, account: Account) -> None:
             urljoin(base_url + "/", "home.php?mod=space"),
             pause=1.5,
         )
-        if page_indicates_logged_in(driver.page_source):
-            print("账号登录成功")
-            return
-
-        # 一些主题不显示“退出”文字，认证 Cookie 可作为补充判断。
-        cookie_names = {
-            cookie.get("name", "").lower() for cookie in driver.get_cookies()
-        }
-        if any("auth" in name for name in cookie_names):
+        if driver_indicates_logged_in(driver):
             print("账号登录成功")
             return
 
@@ -608,26 +644,34 @@ def run() -> int:
     print(f"已读取 {len(accounts)} 个账号")
 
     with managed_webdriver() as discovery_driver:
-        base_url = resolve_forum_url(discovery_driver)
+        base_urls = resolve_forum_urls(discovery_driver)
 
     failures: list[str] = []
     for index, account in enumerate(accounts, start=1):
         masked = mask_username(account.username)
         print(f"开始处理账号 {index}/{len(accounts)}：{masked}")
-        try:
-            with managed_webdriver() as driver:
-                login(driver, base_url, account)
-                result = perform_checkin(driver, base_url)
-            print(f"账号 {masked}：{result}")
-        except CheckinError as exc:
-            failures.append(f"账号 {masked}：{exc}")
-            print(f"账号 {masked} 处理失败：{exc}", file=sys.stderr)
-        except Exception as exc:
-            failures.append(f"账号 {masked}：未预期错误 {type(exc).__name__}")
-            print(
-                f"账号 {masked} 发生未预期错误：{type(exc).__name__}",
-                file=sys.stderr,
-            )
+        account_errors: list[str] = []
+        for address_index, base_url in enumerate(base_urls, start=1):
+            host = urlparse(base_url).hostname or base_url
+            print(f"使用有效地址 {address_index}/{len(base_urls)} 处理账号：{host}")
+            try:
+                with managed_webdriver() as driver:
+                    login(driver, base_url, account)
+                    result = perform_checkin(driver, base_url)
+                print(f"账号 {masked}：{result}")
+                break
+            except CheckinError as exc:
+                account_errors.append(f"{host}：{exc}")
+                print(f"地址 {host} 处理失败：{exc}", file=sys.stderr)
+            except Exception as exc:
+                account_errors.append(f"{host}：未预期错误 {type(exc).__name__}")
+                print(
+                    f"地址 {host} 发生未预期错误：{type(exc).__name__}",
+                    file=sys.stderr,
+                )
+        else:
+            summary = "；".join(account_errors)
+            failures.append(f"账号 {masked}：所有有效地址均失败（{summary}）")
 
     if failures:
         print("签到任务失败：", file=sys.stderr)
